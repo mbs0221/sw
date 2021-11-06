@@ -226,6 +226,7 @@ int32_t dla_data_write(void *driver_context, void *task_data,
 	int32_t ret;
 	void *ptr = NULL;
 	struct dma_buf *buf;
+	struct dma_buf_map map;
 	struct nvdla_mem_handle *handles;
 	struct nvdla_task *task = (struct nvdla_task *)task_data;
 
@@ -241,7 +242,7 @@ int32_t dla_data_write(void *driver_context, void *task_data,
 	if (ret)
 		goto put_dma_buf;
 
-	ptr = dma_buf_vmap(buf);
+	ptr = dma_buf_vmap(buf, &map) ? NULL : map.vaddr;
 	if (!ptr) {
 		pr_err("%s: Failed to vmap dma_buf for handle=%d\n", __func__,
 						handles[dst].handle);
@@ -252,7 +253,7 @@ int32_t dla_data_write(void *driver_context, void *task_data,
 
 	memcpy((void *)((uint8_t *)ptr + offset), src, size);
 
-	dma_buf_vunmap(buf, ptr);
+	dma_buf_vunmap(buf, &map);
 
 end_cpu_access:
 	dma_buf_end_cpu_access(buf, DMA_BIDIRECTIONAL);
@@ -270,6 +271,7 @@ int32_t dla_data_read(void *driver_context, void *task_data,
 	int32_t ret;
 	void *ptr = NULL;
 	struct dma_buf *buf;
+	struct dma_buf_map map;
 	struct nvdla_mem_handle *handles;
 	struct nvdla_task *task = (struct nvdla_task *)task_data;
 
@@ -286,7 +288,7 @@ int32_t dla_data_read(void *driver_context, void *task_data,
 	if (ret)
 		goto put_dma_buf;
 
-	ptr = dma_buf_vmap(buf);
+	ptr = dma_buf_vmap(buf, &map) ? NULL : map.vaddr;
 	if (!ptr) {
 		pr_err("%s: Failed to vmap dma_buf for handle=%d\n", __func__,
 						handles[src].handle);
@@ -296,7 +298,7 @@ int32_t dla_data_read(void *driver_context, void *task_data,
 
 	memcpy(dst, (void *)(((uint8_t *)ptr) + offset), size);
 
-	dma_buf_vunmap(buf, ptr);
+	dma_buf_vunmap(buf, &map);
 
 end_cpu_access:
 	dma_buf_end_cpu_access(buf, DMA_BIDIRECTIONAL);

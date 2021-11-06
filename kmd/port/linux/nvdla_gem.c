@@ -32,11 +32,19 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <linux/version.h>
+#include <linux/dma-buf-map.h>
+#include <linux/dma-mapping.h>
+#include <linux/dma-map-ops.h>
+
 #include <drm/drm.h>
+#include <drm/drm_drv.h>
 #include <drm/drm_gem_cma_helper.h>
 
 #include <nvdla_linux.h>
 #include <nvdla_ioctl.h>
+
+#include "nvdla_gem.h"
 
 #define to_nvdla_obj(x) container_of(x, struct nvdla_gem_object, object)
 
@@ -46,6 +54,10 @@ struct nvdla_gem_object {
 	void *kvaddr;
 	dma_addr_t dma_addr;
 	unsigned long dma_attrs;
+
+	/* Used when IOMMU is enabled */
+	unsigned long num_pages;
+	struct page **pages;
 };
 
 static int32_t nvdla_fill_task_desc(struct nvdla_ioctl_submit_task *local_task,
@@ -145,6 +157,43 @@ static void nvdla_gem_free(struct nvdla_gem_object *nobj)
 				nobj->dma_attrs);
 }
 
+static vm_fault_t nvdla_gem_fault(struct vm_fault *vmf)
+{
+        struct vm_area_struct *vma = vmf->vma;
+        struct drm_gem_object *gem = vma->vm_private_data;
+        struct nvdla_gem_object *nobj = to_nvdla_obj(gem);
+        struct page *page;
+        pgoff_t offset;
+
+        if (!nobj->pages)
+                return VM_FAULT_SIGBUS;
+
+        offset = (vmf->address - vma->vm_start) >> PAGE_SHIFT;
+        page = nobj->pages[offset];
+
+        return vmf_insert_page(vma, vmf->address, page);
+}
+
+const struct vm_operations_struct nvdla_gem_vm_ops = { 
+        .fault = nvdla_gem_fault,
+        .open = drm_gem_vm_open,
+        .close = drm_gem_vm_close,
+};
+
+// https://www.mail-archive.com/amd-gfx@lists.freedesktop.org/msg53124.html
+// https://lists.freedesktop.org/archives/intel-gfx/2019-June/201694.html
+// https://www.spinics.net/lists/linux-tegra/msg53819.html
+// https://patchew.org/Xen/20200915145958.19993-1-tzimmermann@suse.de/20200915145958.19993-18-tzimmermann@suse.de/
+static const struct drm_gem_object_funcs nvdla_gem_object_funcs = {
+	.free = nvdla_gem_free_object,
+	.get_sg_table = nvdla_drm_gem_prime_get_sg_table,
+	.export = drm_gem_prime_export,
+	.vmap = nvdla_drm_gem_prime_vmap,
+	.vunmap = nvdla_drm_gem_prime_vunmap,
+	.vm_ops = &nvdla_gem_vm_ops,
+	// .vm_ops = &drm_gem_cma_vm_ops,
+};
+
 static struct nvdla_gem_object *
 nvdla_gem_create_object(struct drm_device *drm, uint32_t size)
 {
@@ -159,6 +208,8 @@ nvdla_gem_create_object(struct drm_device *drm, uint32_t size)
 		return ERR_PTR(-ENOMEM);
 
 	dobj = &nobj->object;
+
+	dobj->funcs = &nvdla_gem_object_funcs;
 
 	drm_gem_private_object_init(drm, dobj, size);
 
@@ -205,7 +256,7 @@ nvdla_gem_create_with_handle(struct drm_file *file_priv,
 	if (ret)
 		goto free_drm_object;
 
-	drm_gem_object_unreference_unlocked(dobj);
+	drm_gem_object_put(dobj);
 
 	return nobj;
 
@@ -297,16 +348,37 @@ static struct sg_table
 	return sgt;
 }
 
-static void *nvdla_drm_gem_prime_vmap(struct drm_gem_object *obj)
+static int nvdla_drm_gem_prime_vmap(struct drm_gem_object *obj, struct dma_buf_map *map)
 {
 	struct nvdla_gem_object *nobj = to_nvdla_obj(obj);
 
-	return nobj->kvaddr;
+	if (nobj->pages) {
+		void *vaddr = vmap(nobj->pages, nobj->num_pages, VM_MAP,
+						  pgprot_writecombine(PAGE_KERNEL));
+		if (!vaddr)
+			return -ENOMEM;
+		dma_buf_map_set_vaddr(map, vaddr);
+		return 0;
+	}
+
+	if (nobj->dma_attrs & DMA_ATTR_NO_KERNEL_MAPPING)
+		return -ENOMEM;
+
+	dma_buf_map_set_vaddr(map, nobj->kvaddr);
+
+	return 0;
 }
 
-static void nvdla_drm_gem_prime_vunmap(struct drm_gem_object *obj, void *vaddr)
+static void nvdla_drm_gem_prime_vunmap(struct drm_gem_object *obj, struct dma_buf_map *map)
 {
-	/* Nothing to do */
+	struct nvdla_gem_object *nobj = to_nvdla_obj(obj);
+
+	if (nobj->pages) {
+		vunmap(map->vaddr);
+		return;
+	}
+
+	/* Nothing to do if allocated by DMA mapping API. */
 }
 
 int32_t nvdla_gem_dma_addr(struct drm_device *dev, struct drm_file *file,
@@ -329,7 +401,7 @@ int32_t nvdla_gem_dma_addr(struct drm_device *dev, struct drm_file *file,
 
 	*addr = nobj->dma_addr;
 
-	drm_gem_object_put_unlocked(dobj);
+	drm_gem_object_put(dobj);
 
 	return 0;
 }
@@ -352,11 +424,21 @@ static int32_t nvdla_gem_map_offset(struct drm_device *drm, void *data,
 	args->offset = drm_vma_node_offset_addr(&dobj->vma_node);
 
 out:
-	drm_gem_object_unreference_unlocked(dobj);
+	drm_gem_object_put(dobj);
 
 	return 0;
 }
 
+// see: https://gitlab.manjaro.org/packages/extra/linux512-extramodules/nvidia-390xx/-/issues/1
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0))
+static int32_t nvdla_gem_destroy(struct drm_device *drm, void *data,
+				struct drm_file *file)
+{
+	struct nvdla_gem_destroy_args *args = data;
+
+	return drm_gem_handle_delete(file, args->handle);
+}
+#else
 static int32_t nvdla_gem_destroy(struct drm_device *drm, void *data,
 				struct drm_file *file)
 {
@@ -364,6 +446,7 @@ static int32_t nvdla_gem_destroy(struct drm_device *drm, void *data,
 
 	return drm_gem_dumb_destroy(file, drm, args->handle);
 }
+#endif
 
 static const struct file_operations nvdla_drm_fops = {
 	.owner = THIS_MODULE,
@@ -387,20 +470,11 @@ static const struct drm_ioctl_desc nvdla_drm_ioctls[] = {
 };
 
 static struct drm_driver nvdla_drm_driver = {
-	.driver_features = DRIVER_GEM | DRIVER_PRIME | DRIVER_RENDER,
+	.driver_features = DRIVER_GEM  | DRIVER_RENDER,
 
-	.gem_vm_ops = &drm_gem_cma_vm_ops,
-
-	.gem_free_object_unlocked = nvdla_gem_free_object,
 
 	.prime_handle_to_fd = drm_gem_prime_handle_to_fd,
 	.prime_fd_to_handle = drm_gem_prime_fd_to_handle,
-	.gem_prime_export = drm_gem_prime_export,
-	.gem_prime_import = drm_gem_prime_import,
-
-	.gem_prime_get_sg_table	= nvdla_drm_gem_prime_get_sg_table,
-	.gem_prime_vmap		= nvdla_drm_gem_prime_vmap,
-	.gem_prime_vunmap	= nvdla_drm_gem_prime_vunmap,
 	.gem_prime_mmap		= nvdla_drm_gem_mmap_buf,
 
 	.ioctls = nvdla_drm_ioctls,
@@ -415,9 +489,9 @@ static struct drm_driver nvdla_drm_driver = {
 	.patchlevel = 0,
 };
 
+// https://lkml.org/lkml/2019/9/2/810
 int32_t nvdla_drm_probe(struct nvdla_device *nvdla_dev)
 {
-	int32_t dma;
 	int32_t err;
 	struct drm_device *drm;
 	struct drm_driver *driver = &nvdla_drm_driver;
@@ -429,30 +503,12 @@ int32_t nvdla_drm_probe(struct nvdla_device *nvdla_dev)
 	nvdla_dev->drm = drm;
 
 	err = drm_dev_register(drm, 0);
-	if (err < 0)
-		goto unref;
-
-	/**
-	 * TODO Register separate driver for memory and use DT node to
-	 * read memory range
-	 */
-	dma = dma_declare_coherent_memory(drm->dev, 0xC0000000, 0xC0000000,
-			0x40000000, DMA_MEMORY_MAP | DMA_MEMORY_EXCLUSIVE);
-	if (!(dma & DMA_MEMORY_MAP)) {
-		err = -ENOMEM;
-		goto unref;
-	}
-
-	return 0;
-
-unref:
-	drm_dev_unref(drm);
 	return err;
 }
 
 void nvdla_drm_remove(struct nvdla_device *nvdla_dev)
 {
 	drm_dev_unregister(nvdla_dev->drm);
-	dma_release_declared_memory(&nvdla_dev->pdev->dev);
-	drm_dev_unref(nvdla_dev->drm);
+	drm_mode_config_cleanup(nvdla_dev->drm);
+	drm_dev_put(nvdla_dev->drm);
 }
